@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Omarchy session adapter for the existing Tarkin console service.
+# This replaces the command launched by tarkin-console.service; it does NOT
+# define a second display manager or a second compositor-owning systemd unit.
+set -Eeuo pipefail
+
+log() { printf '[tarkin-omarchy] %s\n' "$*" >&2; }
+die() { log "$1"; exit 1; }
+fallback() {
+  local reason="$1" rc="${2:-1}"
+  log "$reason"
+  if [[ "${TARKIN_OMARCHY_FALLBACK:-1}" == "1" && -x /usr/local/libexec/tarkin/console ]]; then
+    log "Retour au lanceur Tarkin d'origine."
+    exec /usr/local/libexec/tarkin/console
+  fi
+  exit "$rc"
+}
+
+# The drop-in sets this marker. Refuse accidental manual launches that could
+# compete with a compositor already owning the display. Never fallback to a
+# second console process when this guard has not passed.
+[[ "${TARKIN_OMARCHY_SESSION:-0}" == "1" ]] || die "Lanceur réservé au drop-in de tarkin-console.service."
+[[ "$(id -u)" -ne 0 ]] || die "La session graphique ne doit pas être lancée en root."
+[[ "$(uname -m)" == "aarch64" ]] || fallback "Architecture incompatible : AArch64 requis."
+
+compatible=""
+if [[ -r /proc/device-tree/compatible ]]; then
+  compatible="$(tr '\0' ' ' </proc/device-tree/compatible 2>/dev/null || true)"
+fi
+[[ "$compatible" == *google,tarkin* ]] || fallback "Device Tree google,tarkin non détecté."
+[[ -d /usr/share/omarchy ]] || fallback "Runtime Omarchy absent (/usr/share/omarchy)."
+[[ -r /var/lib/tarkin/omarchy-ready ]] || fallback "Omarchy first-boot setup has not completed; using the Tarkin terminal."
+command -v uwsm >/dev/null 2>&1 || fallback "uwsm absent."
+[[ -x /usr/local/bin/hyprland-mali ]] || fallback "Lanceur hyprland-mali absent; intégration GPU Tarkin incomplète."
+command -v quickshell >/dev/null 2>&1 || command -v qs >/dev/null 2>&1 || fallback "Quickshell absent."
+
+uid="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+for _ in $(seq 1 60); do
+  [[ -d "$XDG_RUNTIME_DIR" ]] && break
+  sleep 1
+done
+[[ -d "$XDG_RUNTIME_DIR" ]] || fallback "XDG_RUNTIME_DIR indisponible : $XDG_RUNTIME_DIR"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+[[ -S "$XDG_RUNTIME_DIR/bus" ]] || fallback "Bus D-Bus utilisateur absent."
+
+# Reuse the Tarkin base's seatd/display model. The existing systemd service
+# keeps its User=alarm and video/input/render/audio groups.
+export LIBSEAT_BACKEND=seatd
+export SEATD_VTBOUND=0
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_CLASS=user
+export XDG_SEAT="${XDG_SEAT:-seat0}"
+export XDG_CURRENT_DESKTOP=Hyprland
+export XDG_SESSION_DESKTOP=Hyprland
+export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+export PATH="$OMARCHY_PATH/bin:$PATH"
+unset WAYLAND_DISPLAY DISPLAY
+
+# Match the Mediatek DRM node using the same sysfs driver criterion as the
+# CM1406 base. Require exactly one candidate; never guess between two cards.
+drm_cards=()
+for sys_card in /sys/class/drm/card[0-9]*; do
+  [[ -e "$sys_card/device/driver" ]] || continue
+  driver="$(readlink -f "$sys_card/device/driver" 2>/dev/null || true)"
+  [[ "$driver" == *mediatek* ]] || continue
+  card_name="$(basename "$sys_card")"
+  [[ -e "/dev/dri/$card_name" ]] && drm_cards+=("/dev/dri/$card_name")
+done
+if [[ ${#drm_cards[@]} -eq 1 ]]; then
+  export AQ_DRM_DEVICES="${drm_cards[0]}"
+elif [[ ${#drm_cards[@]} -gt 1 ]]; then
+  fallback "Plusieurs cartes DRM MediaTek détectées ; sélection automatique refusée."
+else
+  log "Aucune carte DRM MediaTek identifiée ; Aquamarine utilisera sa détection par défaut."
+fi
+
+log "Démarrage de la session Omarchy via UWSM sur le service Tarkin existant."
+if uwsm start -e -D Hyprland -- /usr/local/bin/hyprland-mali; then
+  exit 0
+else
+  rc=$?
+  fallback "UWSM/Hyprland a échoué (code $rc)." "$rc"
+fi

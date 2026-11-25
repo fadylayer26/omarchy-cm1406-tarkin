@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Install signed Omarchy ARM runtime into the already-prepared Tarkin USB rootfs.
+set -Eeuo pipefail
+
+log() { printf '[omarchy-packages] %s\n' "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "must run in the target rootfs chroot as root"
+[[ "$(uname -m)" == aarch64 ]] || die "AArch64 is required"
+command -v pacman >/dev/null 2>&1 || die "pacman is missing"
+command -v pacman-key >/dev/null 2>&1 || die "pacman-key is missing"
+command -v curl >/dev/null 2>&1 || die "curl is missing"
+
+FPR=40DFB630FF42BCFFB047046CF0134EE680CAC571
+PACMAN_CONF=/etc/pacman.conf
+KEYSERVERS=(hkps://keys.openpgp.org hkps://keyserver.ubuntu.com)
+IGNORE_KERNELS='linux-aarch64,linux-aarch64-headers,linux-omarchy,linux-omarchy-headers,limine,snapper,kernel-modules-hook'
+TMP="$(mktemp -d /var/tmp/tarkin-omarchy.XXXXXX)"
+trap 'rm -rf -- "$TMP"' EXIT
+
+log "Initialisation du trousseau Arch Linux ARM."
+pacman-key --init
+pacman-key --populate archlinuxarm
+
+fingerprint="$(gpg --homedir /etc/pacman.d/gnupg --batch --with-colons --fingerprint "$FPR" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }' || true)"
+if [[ "$fingerprint" != "$FPR" ]]; then
+  imported=0
+  for server in "${KEYSERVERS[@]}"; do
+    log "Récupération de la clé Omarchy sur $server (empreinte complète vérifiée)."
+    if pacman-key --recv-keys "$FPR" --keyserver "$server" >/dev/null 2>&1; then
+      fingerprint="$(gpg --homedir /etc/pacman.d/gnupg --batch --with-colons --fingerprint "$FPR" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }' || true)"
+      if [[ "$fingerprint" == "$FPR" ]]; then imported=1; break; fi
+    fi
+  done
+  (( imported == 1 )) || die "Impossible de récupérer/vérifier la clé Omarchy $FPR. Aucun paquet Omarchy n'a été installé."
+fi
+pacman-key --lsign-key "$FPR" >/dev/null
+
+if ! grep -q '^\[omarchy\]$' "$PACMAN_CONF"; then
+  [[ -f "$PACMAN_CONF" ]] || die "$PACMAN_CONF is missing"
+  awk '
+    /^\[core\]$/ && !done { print "[omarchy]"; print "SigLevel = Required DatabaseOptional"; print "Server = https://pkgs.omarchy.org/edge/$arch"; print ""; done=1 }
+    { print }
+    END { if (!done) exit 17 }
+  ' "$PACMAN_CONF" > "$PACMAN_CONF.tarkin-new" || die "Could not insert the Omarchy repository before [core]."
+  install -m 644 "$PACMAN_CONF.tarkin-new" "$PACMAN_CONF"
+  rm -f "$PACMAN_CONF.tarkin-new"
+fi
+
+log "Synchronisation des dépôts. Aucun noyau ni bootloader Omarchy ne sera installé."
+pacman -Syy --noconfirm
+
+if pacman -Si omarchy-dev >/dev/null 2>&1; then
+  RUNTIME=omarchy-dev
+  SETTINGS=omarchy-settings-dev
+else
+  RUNTIME=omarchy
+  SETTINGS=omarchy-settings
+fi
+pacman -Si "$RUNTIME" >/dev/null 2>&1 || die "Le paquet runtime $RUNTIME n'est pas publié pour aarch64/edge. Vérifie le dépôt Omarchy ARM."
+pacman -Si "$SETTINGS" >/dev/null 2>&1 || die "Le paquet settings $SETTINGS n'est pas publié pour aarch64/edge."
+pacman -Syu --noconfirm --needed --noprogressbar --ignore "$IGNORE_KERNELS" "$SETTINGS" "$RUNTIME"
+
+# Install the upstream AArch64 package additions and the useful subset of the
+# Omarchy base manifest that actually exists for aarch64. No AUR, no unsigned
+# package builds, and no board-specific hardware setup is run here.
+BASE_URL=https://raw.githubusercontent.com/omacom/omarchy/quattro/install
+curl --fail --location --show-error --retry 3 "$BASE_URL/omarchy-base.packages" -o "$TMP/omarchy-base.packages"
+curl --fail --location --show-error --retry 3 "$BASE_URL/omarchy-aarch64.packages" -o "$TMP/omarchy-aarch64.packages"
+
+mapfile -t REPO_PACKAGES < <(pacman -Slq | sort -u)
+declare -A HAVE=()
+for p in "${REPO_PACKAGES[@]}"; do HAVE["$p"]=1; done
+
+candidates=()
+unavailable=()
+while IFS= read -r pkg; do
+  pkg="${pkg%%#*}"
+  pkg="${pkg//[[:space:]]/}"
+  [[ -n "$pkg" ]] || continue
+  case "$pkg" in
+    linux*|limine*|snapper|kernel-modules-hook|sddm|networkmanager|docker*|podman|ufw|ufw-docker|yay|google-chrome|omarchy-power-profiles-daemon)
+      continue ;;
+    nvim)
+      pkg=neovim ;;
+    ttf-jetbrains-mono-nerd-basic)
+      pkg=ttf-jetbrains-mono-nerd ;;
+  esac
+  if [[ -n "${HAVE[$pkg]:-}" ]]; then
+    candidates+=("$pkg")
+  else
+    unavailable+=("$pkg")
+  fi
+done < <(cat "$TMP/omarchy-base.packages" "$TMP/omarchy-aarch64.packages")
+# `omarchy` depends on some packages that may install NetworkManager or SDDM;
+# this port intentionally does not enable those services. The Tarkin base
+# keeps systemd-networkd + wpa_supplicant and tarkin-console as screen owner.
+
+if (( ${#unavailable[@]} )); then
+  mapfile -t unavailable < <(printf '%s\n' "${unavailable[@]}" | sort -u)
+  log "Paquets du manifeste absents des dépôts AArch64 (ignorés, non compilés depuis l'AUR) : ${unavailable[*]}"
+fi
+if (( ${#candidates[@]} )); then
+  mapfile -t candidates < <(printf '%s\n' "${candidates[@]}" | sort -u)
+  log "Installation de ${#candidates[@]} paquets optionnels Omarchy disponibles pour aarch64."
+  if ! pacman -S --needed --noconfirm --noprogressbar --ignore "$IGNORE_KERNELS" "${candidates[@]}"; then
+    log "La transaction optionnelle groupée a échoué; essai individuel des paquets disponibles."
+    for pkg in "${candidates[@]}"; do
+      pacman -S --needed --noconfirm --noprogressbar --ignore "$IGNORE_KERNELS" "$pkg" \
+        || log "OPTIONNEL NON INSTALLÉ : $pkg (voir les dépendances/architecture dans pacman)."
+    done
+  fi
+fi
+
+# Omarchy's first-install finalizer selects google-chrome.desktop even on ARM.
+# Use a native ARM browser and provide that desktop ID without downloading the
+# x86_64 Google Chrome binary. Chromium is preferred; Firefox is a safe fallback.
+BROWSER=""
+if pacman -Si chromium >/dev/null 2>&1; then
+  pacman -S --needed --noconfirm --noprogressbar --ignore "$IGNORE_KERNELS" chromium
+  BROWSER=chromium
+elif pacman -Si firefox >/dev/null 2>&1; then
+  pacman -S --needed --noconfirm --noprogressbar --ignore "$IGNORE_KERNELS" firefox
+  BROWSER=firefox
+else
+  die "No supported AArch64 browser package (chromium/firefox) is available; user finalization requires a browser desktop entry."
+fi
+
+mkdir -p /usr/share/applications
+if [[ -e /usr/share/applications/google-chrome.desktop ]]; then
+  :
+elif [[ "$BROWSER" == chromium && -e /usr/share/applications/chromium.desktop ]]; then
+  install -m 644 /usr/share/applications/chromium.desktop /usr/share/applications/google-chrome.desktop
+elif [[ "$BROWSER" == firefox && -e /usr/share/applications/firefox.desktop ]]; then
+  install -m 644 /usr/share/applications/firefox.desktop /usr/share/applications/google-chrome.desktop
+else
+  cat > /usr/share/applications/google-chrome.desktop <<EOF_BROWSER
+[Desktop Entry]
+Type=Application
+Name=Web Browser
+Exec=$BROWSER %U
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+EOF_BROWSER
+  chmod 644 /usr/share/applications/google-chrome.desktop
+fi
+
+for cmd in omarchy-provision-user uwsm Hyprland; do
+  command -v "$cmd" >/dev/null 2>&1 || die "Required Omarchy command missing after package install: $cmd"
+done
+if ! command -v quickshell >/dev/null 2>&1 && ! command -v qs >/dev/null 2>&1; then
+  die "Required Quickshell executable missing after package install (expected quickshell or qs)."
+fi
+[[ -d /usr/share/omarchy ]] || die "The Omarchy runtime directory /usr/share/omarchy is missing."
+[[ -d /usr/share/omarchy/install/user ]] || die "The Omarchy user setup scripts are missing."
+log "Omarchy AArch64 runtime installé. Les services SDDM/NetworkManager ne sont pas activés; tarkin-console reste propriétaire de l'écran."

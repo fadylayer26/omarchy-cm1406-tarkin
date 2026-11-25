@@ -1,0 +1,7 @@
+# FRAGMENT DE RÉFÉRENCE UNIQUEMENT — ce fichier n'est pas un pacman.conf complet.
+# Aligné sur l'ordre des dépôts du modèle upstream Omarchy AArch64 edge consulté
+# le 21 novembre 2026. Ne pas l'activer seul : l'upstream fournit également les
+# paramètres de signature, le miroir Arch Linux ARM et la gestion du trousseau.
+# Source : https://github.com/omacom/omarchy/blob/quattro/default/pacman/aarch64/pacman-edge.conf
+[omarchy]
+Server = https://pkgs.omarchy.org/edge/$arch

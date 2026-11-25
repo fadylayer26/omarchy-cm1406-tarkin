@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Finalize Omarchy on Tarkin without running the upstream generic hardware/system installer.
+set -Eeuo pipefail
+
+log() { printf '[tarkin-omarchy-firstboot] %s\n' "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ "$(uname -m)" == aarch64 ]] || die "AArch64 required"
+compatible="$(tr '\0' ' ' </proc/device-tree/compatible 2>/dev/null || true)"
+[[ "$compatible" == *google,tarkin* ]] || die "Device Tree google,tarkin not detected"
+[[ -d /usr/share/omarchy ]] || die "Omarchy runtime not installed"
+for cmd in omarchy-provision-user uwsm Hyprland runuser; do command -v "$cmd" >/dev/null 2>&1 || die "missing command: $cmd"; done
+command -v quickshell >/dev/null 2>&1 || command -v qs >/dev/null 2>&1 || die "missing Quickshell executable (quickshell or qs)"
+
+READY=/var/lib/tarkin/omarchy-ready
+[[ -e "$READY" ]] && { log "ready marker already exists; nothing to do."; exit 0; }
+USER_NAME=alarm
+HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+[[ -n "$HOME_DIR" && -d "$HOME_DIR" ]] || die "user alarm/home not found"
+UID_ALARM="$(id -u "$USER_NAME")"
+OMARCHY_PATH=/usr/share/omarchy
+CUSTOM_INSTALL=/usr/local/share/tarkin-omarchy/install
+
+log "Seeding Omarchy's /etc/skel defaults into the existing alarm account."
+mkdir -p "$HOME_DIR"
+if [[ ! -e "$HOME_DIR/.local/state/tarkin-omarchy/skel-applied" ]]; then
+  mkdir -p "$HOME_DIR/.local/state/tarkin-omarchy"
+  if [[ -f "$HOME_DIR/.bashrc" && ! -f "$HOME_DIR/.bashrc.tarkin-base" ]]; then
+    cp -p "$HOME_DIR/.bashrc" "$HOME_DIR/.bashrc.tarkin-base"
+  fi
+  if [[ -d /etc/skel ]]; then cp -an /etc/skel/. "$HOME_DIR/"; fi
+  if [[ -f /etc/skel/.bashrc ]]; then cp -f /etc/skel/.bashrc "$HOME_DIR/.bashrc"; fi
+  if [[ -f "$HOME_DIR/.bashrc" ]] && ! grep -q 'tarkin/shell-notice' "$HOME_DIR/.bashrc"; then
+    cat >> "$HOME_DIR/.bashrc" <<'BASHRC'
+
+# Tarkin: first-boot progress and boot warnings
+[ -r /usr/local/libexec/tarkin/shell-notice ] && . /usr/local/libexec/tarkin/shell-notice
+BASHRC
+  fi
+  touch "$HOME_DIR/.local/state/tarkin-omarchy/skel-applied"
+fi
+
+# Use Omarchy's official user provisioning entrypoint, but replace its generic
+# cross-vendor hardware leaves with a Tarkin-safe list. All selected leaves are
+# still the signed files shipped by the installed Omarchy package.
+mkdir -p "$CUSTOM_INSTALL/user"
+for item in "$OMARCHY_PATH"/install/user/*; do
+  [[ -e "$item" ]] || continue
+  name="${item##*/}"
+  [[ "$name" == all.sh ]] && continue
+  ln -sfn "$item" "$CUSTOM_INSTALL/user/$name"
+done
+ln -sfn "$OMARCHY_PATH/install/helpers" "$CUSTOM_INSTALL/helpers"
+cat > "$CUSTOM_INSTALL/user/all.sh" <<'USERALL'
+run_logged "$OMARCHY_INSTALL/user/theme.sh"
+if command -v chromium >/dev/null 2>&1; then
+  run_logged "$OMARCHY_INSTALL/user/chromium.sh"
+fi
+run_logged "$OMARCHY_INSTALL/user/xcompose.sh"
+run_logged "$OMARCHY_INSTALL/user/language.sh"
+run_logged "$OMARCHY_INSTALL/user/region.sh"
+run_logged "$OMARCHY_INSTALL/user/input-method.sh"
+run_logged "$OMARCHY_INSTALL/user/mise-work.sh"
+run_logged "$OMARCHY_INSTALL/user/default-keyring.sh"
+run_logged "$OMARCHY_INSTALL/user/mise.sh"
+USERALL
+chmod 755 "$CUSTOM_INSTALL/user/all.sh"
+
+chown -R "$USER_NAME:$USER_NAME" "$HOME_DIR"
+mkdir -p /var/log /var/lib/tarkin
+log "Provisioning the alarm user with Omarchy's official user finalizer."
+runuser -u "$USER_NAME" -- env -i \
+  HOME="$HOME_DIR" USER="$USER_NAME" LOGNAME="$USER_NAME" SHELL=/bin/bash \
+  LANG=C.UTF-8 TERM=dumb PATH=/usr/local/sbin:/usr/local/bin:/usr/bin \
+  XDG_RUNTIME_DIR="/run/user/$UID_ALARM" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_ALARM/bus" \
+  OMARCHY_PATH="$OMARCHY_PATH" OMARCHY_INSTALL="$CUSTOM_INSTALL" \
+  OMARCHY_SETUP_CONTEXT=provision-owner \
+  /usr/bin/omarchy-provision-user --first-install
+
+# User audio stack can be activated through the normal user manager; do not
+# enable SDDM, NetworkManager, firewall, Docker, snapper, or generic hardware scripts.
+runuser -u "$USER_NAME" -- env XDG_RUNTIME_DIR="/run/user/$UID_ALARM" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_ALARM/bus" \
+  systemctl --user enable pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null || true
+
+printf '%s\n' "$(date -u +%FT%TZ)" > "$READY"
+chmod 644 "$READY"
+log "Omarchy user setup complete; readiness marker created."
